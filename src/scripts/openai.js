@@ -1077,7 +1077,10 @@ function setOpenAIMessages(chat, stripOldToolCalls = false) {
             && (!includeClaudeNative || hasClaudeToolUse(metadataMessage?.extra?.native))
             ? metadataMessage?.extra?.native
             : null;
-        const shouldReplayReasoningContent = currentApi === chat_completion_sources.DEEPSEEK
+        // DeepSeek V4 thinking models require `reasoning_content` replay on tool follow-ups.
+        // Native source always applies; OpenAI-compatible sources match on the model name.
+        const shouldReplayReasoningContent = (currentApi === chat_completion_sources.DEEPSEEK
+            || isDeepSeekV4Model(currentModel))
             && oai_settings.show_thoughts
             && isSameModel && !isOtherGroupMember;
         const reasoningContent = shouldReplayReasoningContent ? metadataMessage?.extra?.tool_reasoning_content : null;
@@ -1650,7 +1653,11 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
             && [custom_api_formats.GEMINI_INTERACTIONS, custom_api_formats.GEMINI_GENERATE_CONTENT].includes(settings.custom_api_format));
     const canIncludeNative = native => includeNative
         && (!includeClaudeNative || hasClaudeToolUse(native));
-    const isToolReasoningProvider = interleaved_reasoning_providers.includes(settings.chat_completion_source);
+    // DeepSeek V4 thinking models must replay `reasoning_content` instead of the
+    // plaintext `reasoning` field: OpenRouter translates the latter into the
+    // DeepSeek prefix-completion form, which is rejected on tool-call turns.
+    const isToolReasoningProvider = interleaved_reasoning_providers.includes(settings.chat_completion_source)
+        && !isDeepSeekV4Model(getChatCompletionModel(settings));
     const toolReasoningMode = isToolReasoningProvider
         ? getEffectiveToolReasoningMode(settings)
         : tool_reasoning_modes.DISABLED;
@@ -8448,6 +8455,21 @@ function getToolReasoningMode(settings = oai_settings) {
         return mode;
     }
     return tool_reasoning_modes.DISABLED;
+}
+
+/**
+ * Checks if the model belongs to the DeepSeek V4 thinking family (flash / v4.x),
+ * which requires `reasoning_content` to be replayed on tool follow-up turns.
+ * Applies to OpenAI-compatible sources that only expose the model name
+ * (custom / openrouter / opencode). Vendor-prefixed ids like
+ * `deepseek/deepseek-v4-flash` are resolved to their model segment.
+ * Legacy models (deepseek-chat / 3.x) are excluded on purpose.
+ * @param {string} model Model id to check
+ * @returns {boolean} True if the model belongs to the DeepSeek V4 family
+ */
+function isDeepSeekV4Model(model) {
+    const modelId = String(model ?? '').trim().toLowerCase().split('/').pop() ?? '';
+    return modelId.startsWith('deepseek-v4') || modelId.startsWith('deepseek-flash');
 }
 
 /**

@@ -58,7 +58,7 @@ pub(super) fn build_payload(
         return openai_responses::build(payload);
     }
 
-    match source {
+    let (endpoint, mut upstream_payload) = match source {
         ChatCompletionSource::OpenAi
         | ChatCompletionSource::Groq
         | ChatCompletionSource::SiliconFlow
@@ -86,7 +86,15 @@ pub(super) fn build_payload(
         ChatCompletionSource::AwsBedrock => Ok(aws_bedrock::build(payload)?),
         ChatCompletionSource::Makersuite => Ok(makersuite::build(payload)?),
         ChatCompletionSource::VertexAi => Ok(vertexai::build(payload)?),
+    }?;
+
+    // DeepSeek V4 thinking models behind OpenAI-compatible sources reuse the
+    // native DeepSeek tool-context fix-up (see deepseek::fix_upstream_tool_context).
+    if source != ChatCompletionSource::DeepSeek {
+        deepseek::fix_upstream_tool_context(&endpoint, &mut upstream_payload)?;
     }
+
+    Ok((endpoint, upstream_payload))
 }
 
 pub(super) fn validate_upstream_tool_transcript(
@@ -242,6 +250,155 @@ mod tests {
                 endpoint
             );
         }
+    }
+
+    #[test]
+    fn compatible_sources_fill_missing_reasoning_content_for_deepseek_v4_tool_context() {
+        for source in [
+            ChatCompletionSource::OpenRouter,
+            ChatCompletionSource::Custom,
+            ChatCompletionSource::OpenCode,
+        ] {
+            for model in [
+                "deepseek/deepseek-v4-flash",
+                "deepseek/deepseek-flash",
+                "deepseek-flash-v4.1",
+                "deepseek-v4-pro-0813",
+                "opencodego/deepseek-flash",
+                "newapi/openrouter/deepseek-v4.1-flash",
+            ] {
+                let payload = json!({
+                    "chat_completion_source": "custom",
+                    "custom_api_format": "openai_compat",
+                    "opencode_api_format": "openai_compat",
+                    "model": model,
+                    "messages": [
+                        {"role":"user","content":"weather"},
+                        {"role":"assistant","content":"I'll check."},
+                        {"role":"user","content":"ok"},
+                        {
+                            "role":"assistant",
+                            "content":"",
+                            "tool_calls":[{
+                                "id":"call_1",
+                                "type":"function",
+                                "function":{"name":"weather","arguments":"{}"}
+                            }]
+                        },
+                        {"role":"tool","tool_call_id":"call_1","content":"cloudy"}
+                    ],
+                    "tools": [{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]
+                })
+                .as_object()
+                .cloned()
+                .expect("payload must be object");
+
+                let (endpoint, upstream) = build_payload(source, payload)
+                    .unwrap_or_else(|error| panic!("{source:?} {model}: {error}"));
+                assert_eq!(endpoint, "/chat/completions", "{source:?} {model}");
+
+                let messages = upstream
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .expect("messages must be array");
+
+                for index in [1_usize, 3] {
+                    let assistant = messages
+                        .get(index)
+                        .and_then(Value::as_object)
+                        .unwrap_or_else(|| panic!("{source:?} {model}: message {index} missing"));
+                    assert_eq!(
+                        assistant.get("reasoning_content").and_then(Value::as_str),
+                        Some(""),
+                        "{source:?} {model}: assistant {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compatible_sources_keep_deepseek_3_2_messages_untouched() {
+        let payload = json!({
+            "chat_completion_source": "custom",
+            "custom_api_format": "openai_compat",
+            "model": "deepseek-3.2",
+            "messages": [
+                {"role":"user","content":"weather"},
+                {"role":"assistant","content":"I'll check."},
+                {
+                    "role":"assistant",
+                    "content":"",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"weather","arguments":"{}"}
+                    }]
+                },
+                {"role":"tool","tool_call_id":"call_1","content":"cloudy"}
+            ],
+            "tools": [{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]
+        })
+        .as_object()
+        .cloned()
+        .expect("payload must be object");
+
+        let (_, upstream) = build_payload(ChatCompletionSource::Custom, payload)
+            .expect("payload should build");
+        let messages = upstream
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages must be array");
+
+        for index in [1_usize, 2] {
+            let assistant = messages
+                .get(index)
+                .and_then(Value::as_object)
+                .expect("assistant must be object");
+            assert!(
+                assistant.get("reasoning_content").is_none(),
+                "deepseek-3.2 must stay untouched at {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_sources_do_not_touch_non_deepseek_models() {
+        let payload = json!({
+            "chat_completion_source": "custom",
+            "custom_api_format": "openai_compat",
+            "model": "qwen3-max",
+            "messages": [
+                {"role":"user","content":"weather"},
+                {
+                    "role":"assistant",
+                    "content":"",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"weather","arguments":"{}"}
+                    }]
+                },
+                {"role":"tool","tool_call_id":"call_1","content":"cloudy"}
+            ],
+            "tools": [{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]
+        })
+        .as_object()
+        .cloned()
+        .expect("payload must be object");
+
+        let (_, upstream) = build_payload(ChatCompletionSource::Custom, payload)
+            .expect("payload should build");
+        let messages = upstream
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages must be array");
+
+        let assistant = messages
+            .get(1)
+            .and_then(Value::as_object)
+            .expect("assistant must be object");
+        assert!(assistant.get("reasoning_content").is_none());
     }
 
     #[test]
