@@ -58,7 +58,18 @@ pub(super) fn build_payload(
         return openai_responses::build(payload);
     }
 
-    match source {
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let has_tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+
+    let (endpoint, mut upstream_payload) = match source {
         ChatCompletionSource::OpenAi
         | ChatCompletionSource::Groq
         | ChatCompletionSource::SiliconFlow
@@ -86,7 +97,23 @@ pub(super) fn build_payload(
         ChatCompletionSource::AwsBedrock => Ok(aws_bedrock::build(payload)?),
         ChatCompletionSource::Makersuite => Ok(makersuite::build(payload)?),
         ChatCompletionSource::VertexAi => Ok(vertexai::build(payload)?),
+    }?;
+
+    // DeepSeek V4 thinking models require `reasoning_content` on every
+    // assistant message in a tool context. OpenAI-compatible sources that
+    // only see the model name (custom / openrouter / opencode) reuse the
+    // same DeepSeek fix-up so tool follow-ups do not fail with 400.
+    if source != ChatCompletionSource::DeepSeek
+        && deepseek::is_deepseek_v4_model(&model)
+        && endpoint == "/chat/completions"
+        && let Some(body) = upstream_payload.as_object_mut()
+        && let Some(messages) = body.get_mut("messages")
+        && let Some(messages) = messages.as_array_mut()
+    {
+        deepseek::ensure_tool_context_reasoning_content(messages, has_tools)?;
     }
+
+    Ok((endpoint, upstream_payload))
 }
 
 pub(super) fn validate_upstream_tool_transcript(
@@ -242,6 +269,153 @@ mod tests {
                 endpoint
             );
         }
+    }
+
+    #[test]
+    fn compatible_sources_fill_missing_reasoning_content_for_deepseek_v4_tool_context() {
+        for source in [
+            ChatCompletionSource::OpenRouter,
+            ChatCompletionSource::Custom,
+            ChatCompletionSource::OpenCode,
+        ] {
+            for model in [
+                "deepseek/deepseek-v4-flash",
+                "deepseek/deepseek-flash",
+                "deepseek-flash-v4.1",
+                "deepseek-v4-pro-0813",
+            ] {
+                let payload = json!({
+                    "chat_completion_source": "custom",
+                    "custom_api_format": "openai_compat",
+                    "opencode_api_format": "openai_compat",
+                    "model": model,
+                    "messages": [
+                        {"role":"user","content":"weather"},
+                        {"role":"assistant","content":"I'll check."},
+                        {"role":"user","content":"ok"},
+                        {
+                            "role":"assistant",
+                            "content":"",
+                            "tool_calls":[{
+                                "id":"call_1",
+                                "type":"function",
+                                "function":{"name":"weather","arguments":"{}"}
+                            }]
+                        },
+                        {"role":"tool","tool_call_id":"call_1","content":"cloudy"}
+                    ],
+                    "tools": [{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]
+                })
+                .as_object()
+                .cloned()
+                .expect("payload must be object");
+
+                let (endpoint, upstream) = build_payload(source, payload)
+                    .unwrap_or_else(|error| panic!("{source:?} {model}: {error}"));
+                assert_eq!(endpoint, "/chat/completions", "{source:?} {model}");
+
+                let messages = upstream
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .expect("messages must be array");
+
+                for index in [1_usize, 3] {
+                    let assistant = messages
+                        .get(index)
+                        .and_then(Value::as_object)
+                        .unwrap_or_else(|| panic!("{source:?} {model}: message {index} missing"));
+                    assert_eq!(
+                        assistant.get("reasoning_content").and_then(Value::as_str),
+                        Some(""),
+                        "{source:?} {model}: assistant {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compatible_sources_keep_deepseek_3_2_messages_untouched() {
+        let payload = json!({
+            "chat_completion_source": "custom",
+            "custom_api_format": "openai_compat",
+            "model": "deepseek-3.2",
+            "messages": [
+                {"role":"user","content":"weather"},
+                {"role":"assistant","content":"I'll check."},
+                {
+                    "role":"assistant",
+                    "content":"",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"weather","arguments":"{}"}
+                    }]
+                },
+                {"role":"tool","tool_call_id":"call_1","content":"cloudy"}
+            ],
+            "tools": [{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]
+        })
+        .as_object()
+        .cloned()
+        .expect("payload must be object");
+
+        let (_, upstream) = build_payload(ChatCompletionSource::Custom, payload)
+            .expect("payload should build");
+        let messages = upstream
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages must be array");
+
+        for index in [1_usize, 2] {
+            let assistant = messages
+                .get(index)
+                .and_then(Value::as_object)
+                .expect("assistant must be object");
+            assert!(
+                assistant.get("reasoning_content").is_none(),
+                "deepseek-3.2 must stay untouched at {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_sources_do_not_touch_non_deepseek_models() {
+        let payload = json!({
+            "chat_completion_source": "custom",
+            "custom_api_format": "openai_compat",
+            "model": "qwen3-max",
+            "messages": [
+                {"role":"user","content":"weather"},
+                {
+                    "role":"assistant",
+                    "content":"",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"weather","arguments":"{}"}
+                    }]
+                },
+                {"role":"tool","tool_call_id":"call_1","content":"cloudy"}
+            ],
+            "tools": [{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]
+        })
+        .as_object()
+        .cloned()
+        .expect("payload must be object");
+
+        let (_, upstream) = build_payload(ChatCompletionSource::Custom, payload)
+            .expect("payload should build");
+        let messages = upstream
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages must be array");
+
+        let assistant = messages
+            .get(1)
+            .and_then(Value::as_object)
+            .expect("assistant must be object");
+        assert!(assistant.get("reasoning_content").is_none());
     }
 
     #[test]

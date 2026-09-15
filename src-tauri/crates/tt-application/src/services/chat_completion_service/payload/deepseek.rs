@@ -95,10 +95,18 @@ fn resolve_thinking_mode(
                 }
             })
             .or_else(|| {
-                (model.starts_with("deepseek-v4") || model == "deepseek-flash")
-                    .then_some(DeepSeekThinkingMode::Enabled)
+                is_deepseek_v4_model(&model).then_some(DeepSeekThinkingMode::Enabled)
             }),
     }
+}
+
+/// DeepSeek V4 family (flash / v4.x) defaults to thinking mode enabled and
+/// requires `reasoning_content` to be replayed on tool-follow-up turns.
+/// Legacy models (deepseek-chat / 3.x aliases) are excluded on purpose.
+/// OpenRouter-style `vendor/model` ids are resolved to their model segment.
+pub(super) fn is_deepseek_v4_model(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    model.starts_with("deepseek-v4") || model.starts_with("deepseek-flash")
 }
 
 fn normalize_reasoning_effort(value: &str) -> Result<Option<&'static str>, ApplicationError> {
@@ -147,7 +155,7 @@ fn apply_thinking_mode(
     }
 }
 
-fn ensure_tool_context_reasoning_content(
+pub(super) fn ensure_tool_context_reasoning_content(
     messages: &mut [Value],
     has_tools: bool,
 ) -> Result<(), ApplicationError> {
@@ -269,6 +277,7 @@ mod tests {
             "deepseek-v4-flash",
             "deepseek-v4-flash-vision-exp",
             "deepseek-flash",
+            "deepseek-flash-v4.1",
             "deepseek-v4-pro",
         ] {
             let payload = json!({
