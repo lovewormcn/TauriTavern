@@ -283,6 +283,8 @@ mod tests {
                 "deepseek/deepseek-flash",
                 "deepseek-flash-v4.1",
                 "deepseek-v4-pro-0813",
+                "opencodego/deepseek-flash",
+                "newapi/openrouter/deepseek-v4.1-flash",
             ] {
                 let payload = json!({
                     "chat_completion_source": "custom",
