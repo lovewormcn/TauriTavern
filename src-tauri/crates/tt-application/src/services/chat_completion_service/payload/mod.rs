@@ -58,17 +58,6 @@ pub(super) fn build_payload(
         return openai_responses::build(payload);
     }
 
-    let model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    let has_tools = payload
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty());
-
     let (endpoint, mut upstream_payload) = match source {
         ChatCompletionSource::OpenAi
         | ChatCompletionSource::Groq
@@ -99,18 +88,10 @@ pub(super) fn build_payload(
         ChatCompletionSource::VertexAi => Ok(vertexai::build(payload)?),
     }?;
 
-    // DeepSeek V4 thinking models require `reasoning_content` on every
-    // assistant message in a tool context. OpenAI-compatible sources that
-    // only see the model name (custom / openrouter / opencode) reuse the
-    // same DeepSeek fix-up so tool follow-ups do not fail with 400.
-    if source != ChatCompletionSource::DeepSeek
-        && deepseek::is_deepseek_v4_model(&model)
-        && endpoint == "/chat/completions"
-        && let Some(body) = upstream_payload.as_object_mut()
-        && let Some(messages) = body.get_mut("messages")
-        && let Some(messages) = messages.as_array_mut()
-    {
-        deepseek::ensure_tool_context_reasoning_content(messages, has_tools)?;
+    // DeepSeek V4 thinking models behind OpenAI-compatible sources reuse the
+    // native DeepSeek tool-context fix-up (see deepseek::fix_upstream_tool_context).
+    if source != ChatCompletionSource::DeepSeek {
+        deepseek::fix_upstream_tool_context(&endpoint, &mut upstream_payload)?;
     }
 
     Ok((endpoint, upstream_payload))

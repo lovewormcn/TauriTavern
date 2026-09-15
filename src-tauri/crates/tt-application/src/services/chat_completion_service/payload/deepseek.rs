@@ -103,9 +103,15 @@ fn resolve_thinking_mode(
 /// DeepSeek V4 family (flash / v4.x) defaults to thinking mode enabled and
 /// requires `reasoning_content` to be replayed on tool-follow-up turns.
 /// Legacy models (deepseek-chat / 3.x aliases) are excluded on purpose.
-/// OpenRouter-style `vendor/model` ids are resolved to their model segment.
-pub(super) fn is_deepseek_v4_model(model: &str) -> bool {
-    let model = model.rsplit('/').next().unwrap_or(model);
+/// Case-insensitive; vendor-prefixed ids (`a/b/deepseek-v4`) resolve to the
+/// final path segment.
+fn is_deepseek_v4_model(model: &str) -> bool {
+    let model = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase();
     model.starts_with("deepseek-v4") || model.starts_with("deepseek-flash")
 }
 
@@ -153,6 +159,38 @@ fn apply_thinking_mode(
             );
         }
     }
+}
+
+/// Post-build fix-up for OpenAI-compatible sources routed to a DeepSeek V4
+/// model (custom / openrouter / opencode). Reads the upstream payload so the
+/// check sees exactly what will be sent, then fills missing
+/// `reasoning_content` on assistant messages in a tool context.
+pub(super) fn fix_upstream_tool_context(
+    endpoint: &str,
+    upstream_payload: &mut Value,
+) -> Result<(), ApplicationError> {
+    let Some(body) = upstream_payload.as_object_mut() else {
+        return Ok(());
+    };
+
+    if endpoint != "/chat/completions"
+        || !body
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(is_deepseek_v4_model)
+    {
+        return Ok(());
+    }
+
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+
+    ensure_tool_context_reasoning_content(messages, has_tools)
 }
 
 pub(super) fn ensure_tool_context_reasoning_content(
